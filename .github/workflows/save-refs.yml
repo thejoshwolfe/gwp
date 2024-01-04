@@ -1,0 +1,17 @@
+on:
+  # Capture common activity:
+  push: {}
+  delete: {}
+  # Capture refs/pull/$N/head and refs/pull/$N/merge:
+  pull_request:
+    types: [opened, closed, reopened]
+jobs:
+  Save-Refs:
+    runs-on: ubuntu-latest
+    steps:
+    - name: check out gwp
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: bin
+    - name: save refs
+      run: bin/git-refs --remote save --as-github-action
