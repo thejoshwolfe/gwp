@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+
+import sys, os
+import re, json
+import subprocess, shlex
+
+refs_db_ref_name = "refs/gwp/refs-db"
+github_action_permission_note = "Note: To grant write permissions to a github action, go to your repo in GitHub | Settings | Actions | General | Workflow permissions | Read and write permissions. (As of 2024/01/01.)"
+
+def cli():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=["save", "install", "uninstall", "init-in-new-repo", "log"])
+    parser.add_argument("--remote", action="store_true", help=
+        "Switch to the remote version of the command.")
+    parser.add_argument("-f", "--force", action="store_true")
+    parser.add_argument("--purge", action="store_true", help=
+        "also delete the history database forever")
+
+    parser.add_argument("--as-github-action", action="store_true", help=
+        "Give this argument if you're running 'save' or 'install' with '--remote' to determine url, auth, actor, etc. from the environment. "
+        + github_action_permission_note)
+    parser.add_argument("--vendor", action="store_true", help=
+        "When running 'install' with '--remote', give this option to vendor this program into your repo automatically. "
+        "This program will be installed at `deps/gwp/git-refs`. "
+        "See also the --git-vendor option.")
+    parser.add_argument("--git-vendor", help=
+        "When using --vendor, use this option to give a path to `git-vendor`. "
+        "Omitting this option will install `git-vendor` along with this script. "
+        "`git-vendor` can be found here: https://github.com/thejoshwolfe/git-vendor")
+
+    args = parser.parse_args()
+
+    if args.action == "init-in-new-repo":
+        subprocess.run([__file__, "install"], check=True)
+        subprocess.run([__file__, "install", "--remote", "--vendor", "--as-github-action"], check=True)
+    elif args.action == "save":
+        if not args.remote:
+            do_save()
+        else:
+            if not args.as_github_action:
+                parser.error("--as-github-action is required for --remote save")
+            do_remote_save(args.as_github_action)
+    elif args.action == "install":
+        if not args.remote:
+            do_install(args.force)
+        else:
+            if not args.as_github_action:
+                parser.error("--as-github-action is required for --remote install")
+            do_remote_install(args.force, args.as_github_action, args.vendor, args.git_vendor)
+    elif args.action == "uninstall":
+        if not args.remote:
+            do_uninstall(args.purge)
+        else:
+            if not args.as_github_action:
+                parser.error("--as-github-action is required for --remote uninstall")
+            do_remote_uninstall(args.purge)
+    elif args.action == "log":
+        do_log()
+
+def do_log():
+    try:
+        history_lines = git(
+            "rev-list", "--format=%H %at %ah", "--no-commit-header", refs_db_ref_name,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        sys.exit("ERROR: git-refs is not installed. try `git-refs install`")
+    # Now that the above error handling is done, we're confident that spawning this child process is not a waste.
+    less_process = subprocess.Popen(["less", "-RXF"], stdin=subprocess.PIPE)
+    try:
+        log_loop(history_lines, less_process.stdin)
+    except (KeyboardInterrupt, BrokenPipeError):
+        # It's typical for this command to have super long output, so it's not an error to interrupt it in the middle.
+        # Broken pipe is what happens when output is being piped into a process that closes its stdin,
+        # e.g. piping into `head` or quitting out of `less`.
+        pass
+    finally:
+        less_process.stdin.close()
+    less_process.wait()
+def log_loop(history_lines, output_pipe):
+    current_commit, current_date_seconds, current_date_human = None, None, None
+    current_db = None
+
+    def flush(next_commit, next_date_seconds, next_date_human):
+        nonlocal current_commit, current_date_seconds, current_date_human
+        nonlocal current_db
+
+        if next_commit != None:
+            next_db = load_saved_refs_db(next_commit)
+        else:
+            next_db = {}
+
+        if current_db != None:
+            # - [deleted]           origin/experiment-versions
+            #   8b1c22f1..a5f4e109  origin/main
+            # * [new branch]        origin/dc/grid-size-300
+            #   9b19d82e..a3896d61  origin/experiment-activation
+
+            added_keys, modified_keys, removed_keys = diff_dicts(next_db, current_db)
+            block_of_lines = [
+                "{:<30} {}\n".format("{} {}..{}".format("+", "[new]", shorten_ref(current_db[key])), key)
+                for key in sorted(added_keys)
+            ] + [
+                "{:<30} {}\n".format("{} {}..{}".format(" ", shorten_ref(next_db[key]), shorten_ref(current_db[key])), key)
+                for key in sorted(modified_keys)
+            ] + [
+                "{:<30} {}\n".format("{} {}..{}".format("-", shorten_ref(next_db[key]), "[deleted]"), key)
+                for key in sorted(removed_keys)
+            ]
+
+            # Put the human timestamp in the front of the first line, and just space for the following lines.
+            block_of_lines[0] = "{:<16} {}".format(current_date_human, block_of_lines[0])
+            block_of_lines[1:] = ["{:<16} {}".format("", line) for line in block_of_lines[1:]]
+
+            # Draw a line in temporal gaps.
+            if next_date_seconds == None or next_date_seconds < current_date_seconds - 5 * 60:
+                block_of_lines[-1] = add_underline(block_of_lines[-1])
+
+            output_pipe.write("".join(block_of_lines).encode("utf8"))
+            output_pipe.flush()
+
+        current_commit, current_date_seconds, current_date_human = next_commit, next_date_seconds, next_date_human
+        current_db = next_db
+
+    for history_line in history_lines:
+        # Example:
+        #  29bca3a24502c56ce67726fdf9a512e7c37dc555 1700512148 52 minutes ago
+        next_commit, next_date_seconds_str, next_date_human = history_line.split(" ", 2)
+        flush(next_commit, int(next_date_seconds_str), next_date_human)
+    flush(None, None, None)
+
+def diff_dicts(a, b):
+    added_keys = b.keys() - a.keys()
+    removed_keys = a.keys() - b.keys()
+    modified_keys = {
+        key
+        for key in a.keys() & b.keys()
+        if a[key] != b[key]
+    }
+    return added_keys, modified_keys, removed_keys
+
+def add_underline(line):
+    return "\x1b[4m{}\x1b[m{}".format(line[:47], line[47:])
+
+def do_save():
+    old_db = load_saved_refs_db(refs_db_ref_name)
+    new_db = compute_refs_db()
+
+    if old_db == new_db: return
+
+    # Get parent commit.
+    try:
+        [parent_commit_object_name] = git("rev-parse", "--verify", refs_db_ref_name, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        parent_commit_object_name = None
+
+    commit_object_name = make_commit_for_db(new_db, parent_commit_object_name)
+
+    if parent_commit_object_name != None:
+        update_ref_extra_args = [parent_commit_object_name]
+    else:
+        # first commit
+        update_ref_extra_args = []
+
+    git("update-ref", refs_db_ref_name, commit_object_name, *update_ref_extra_args)
+
+def make_commit_for_db(new_db, parent_commit_object_name, name_override=None, email_override=None):
+    # Save to refs_db_ref_name
+    new_content = format_refs_db(new_db)
+    [blob_object_name] = git("hash-object", "-w", "-t", "blob", "--stdin", input=new_content.encode("utf8"))
+    tree_content = "100644 blob {}\t{}\n".format(blob_object_name, "refs")
+    [tree_object_name] = git("mktree", input=tree_content.encode("utf8"))
+    cmd = ["commit-tree", tree_object_name]
+    if parent_commit_object_name != None:
+        cmd.extend(["-p", parent_commit_object_name])
+    if email_override:
+        cmd[:0] = ["-c", "user.email=" + email_override]
+    if name_override:
+        cmd[:0] = ["-c", "user.name=" + name_override]
+
+    [commit_object_name] = git(*cmd, input=b"")
+    return commit_object_name
+
+def do_remote_save(as_github_action):
+    name_override = None
+    email_override = None
+    if as_github_action:
+        url = "origin"
+        name_override = os.environ["GITHUB_ACTOR"]
+        email_override = "none@none.invalid"
+    else:
+        url = TODO()
+        assert False, "TODO"
+    lines = git("ls-remote", "--symref", url)
+    new_db = {}
+    symrefs = {}
+    for line in lines:
+        value, ref_name = line.split("\t", 1)
+        if ref_name == refs_db_ref_name:
+            # Trying to version control the version control db itself would lead to perpetual dirty state.
+            continue
+        if value.startswith("ref: "):
+            symrefs[ref_name] = "ref:" + value[len("ref: "):]
+        else:
+            new_db[ref_name] = value
+
+    # We get symbolic *and* resolved entries for HEAD, so overwrite the non-symbolic refs with the more correct symrefs, if we get them.
+    new_db.update(symrefs)
+
+    # We need the existing db for two reasons.
+    # We need to check if the current content is any different.
+    # And we need an object name for the parent commit field.
+    try:
+        git("fetch",
+            "--depth", "1",
+            url, refs_db_ref_name,
+            # This saves to FETCH_HEAD.
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        parent_commit_object_name = None
+        old_db = {}
+    else:
+        [parent_commit_object_name] = git("rev-parse", "--verify", "FETCH_HEAD")
+        old_db = load_saved_refs_db(parent_commit_object_name)
+
+    if old_db == new_db:
+        # No change.
+        return
+
+    commit_object_name = make_commit_for_db(
+        new_db, parent_commit_object_name,
+        name_override=name_override,
+        email_override=email_override,
+    )
+
+    git("push", url, "{}:{}".format(commit_object_name, refs_db_ref_name))
+
+def do_install(force):
+    # The reference-transaction hook always executes in the repo root.
+    [cwd] = git("rev-parse", "--show-toplevel")
+    save_cmd = format_script_to_call_this_file("save", cwd=cwd)
+
+    [hooks_dir] = git("rev-parse", "--git-path", "hooks")
+    preamble = [
+        '#!/usr/bin/env bash',
+        '',
+        '# Ignore any diff passed in on stdin.',
+        'exec 0<&-',
+        '',
+        'unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE',
+        'unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE',
+        '',
+    ]
+
+    # This catches almost all ref updates, but not symbolic ref updates.
+    install_hook(force,
+        os.path.join(hooks_dir, "reference-transaction"),
+        preamble + [
+            'if [[ "$1" == committed ]]; then',
+            '    ' + save_cmd,
+            'fi',
+        ],
+    )
+
+    # Symbolic ref updates happen during rebase (HEAD gets detached and reattached).
+    install_hook(force,
+        os.path.join(hooks_dir, "post-rewrite"),
+        preamble + [
+            save_cmd,
+        ],
+    )
+
+    # Symbolic ref updates happen during checkout (switching branches)
+    install_hook(force,
+        os.path.join(hooks_dir, "post-checkout"),
+        preamble + [
+            '# flag=1 is a branch checkout (not a file checkout).',
+            'if [[ "$3" == 1 ]]; then',
+            '    ' + save_cmd,
+            'fi',
+        ],
+    )
+
+    # Also do a save before we're done.
+    do_save()
+
+def do_uninstall(should_purge):
+    [hooks_dir] = git("rev-parse", "--git-path", "hooks")
+    for name in ["post-rewrite", "reference-transaction", "post-checkout"]:
+        path = os.path.join(hooks_dir, name)
+        # Make sure we're deleting our own hook
+        try:
+            with open(path) as f:
+                if "git-refs" not in f.read():
+                    # That's your script, not mine. I won't delete it.
+                    continue
+        except FileNotFoundError:
+            continue
+        os.remove(path)
+    if should_purge:
+        git("update-ref", "-d", refs_db_ref_name)
+        # For some reason the above command exits successfully when the ref doesn't exist.
+
+def install_hook(force, hook_path, content_lines):
+    content = "\n".join(content_lines) + "\n"
+
+    write_file_if_not_exists(hook_path, content, force)
+
+    if (os.stat(hook_path).st_mode & 0o100) == 0:
+        os.chmod(hook_path, 0o766)
+
+def do_remote_install(force, as_github_action, should_vendor, git_vendor_path):
+    [repo_root] = git("rev-parse", "--show-toplevel")
+    [this_script_repo_root] = git("rev-parse", "--show-toplevel", cwd=os.path.dirname(os.path.abspath(__file__)))
+    this_file = __file__
+
+    if repo_root != this_script_repo_root:
+        if not should_vendor:
+            sys.exit("ERROR: You need to install this script into your repo first. try the '--vendor' option.")
+        this_file = do_vendor(repo_root, this_script_repo_root, git_vendor_path)
+    elif should_vendor:
+        sys.exit("ERROR: This script is already in your repo. Please omit the '--vendor' option.")
+
+    save_refs_script = format_script_to_call_this_file("--remote", "save", "--as-github-action", this_file=this_file, cwd=repo_root)
+
+    action_path = os.path.join(repo_root, ".github/workflows/save-refs.yml")
+    action_yaml = """\
+on:
+  # Capture common activity:
+  push: {}
+  delete: {}
+  # Capture refs/pull/$N/head and refs/pull/$N/merge:
+  pull_request:
+    types: [opened, closed, reopened]
+jobs:
+  Save-Refs:
+    runs-on: ubuntu-latest
+    steps:
+    - name: check out gwp
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: %(save_refs_dir)s
+    - name: save refs
+      run: %(save_refs_script)s
+""" % {
+        "save_refs_dir": repr_yaml_1_2_str_plain_one_line_in_flow_out_context(os.path.relpath(os.path.dirname(this_file), repo_root)),
+        "save_refs_script": repr_yaml_1_2_str_plain_one_line_in_flow_out_context(save_refs_script),
+    }
+
+    os.makedirs(os.path.dirname(action_path), exist_ok=True)
+    write_file_if_not_exists(action_path, action_yaml, force)
+
+    git("add", os.path.relpath(action_path, repo_root), cwd=repo_root)
+    if git("status", "--porcelain", os.path.relpath(action_path, repo_root), cwd=repo_root):
+        git("status", cwd=repo_root, stdout=None)
+        print("===============================================")
+        print("Run 'git commit' and push the changes.")
+        print(github_action_permission_note)
+        print("===============================================")
+
+def do_vendor(repo_root, this_script_repo_root, git_vendor_path):
+    if git_vendor_path == None:
+        cmd = [
+            os.path.join(this_script_repo_root, "deps/git-vendor/git-vendor"),
+            "self",
+        ]
+        try:
+            subprocess.run(cmd, cwd=repo_root, check=True)
+        except FileNotFoundError:
+            sys.exit("ERROR: Cannot find `git-vendor` relative to this script. If this script is being run outside its source repo, give the '--git-vendor' option.")
+        # Now use the new one.
+        git_vendor_path = os.path.join(repo_root, "deps/git-vendor/git-vendor")
+    subprocess.run([
+        git_vendor_path, "add",
+        "--dir", "deps/gwp",
+        "--url", "https://github.com/thejoshwolfe/gwp.git",
+        "--follow-branch", "main",
+        "--subdir", "bin",
+    ], cwd=repo_root, check=True)
+
+    return os.path.join(repo_root, "deps/gwp/git-refs")
+
+def format_script_to_call_this_file(*args, this_file=__file__, cwd):
+    path_to_this_script = os.path.relpath(this_file, cwd)
+    if os.path.sep not in path_to_this_script:
+        path_to_this_script = os.path.join(".", path_to_this_script)
+    cmd = [path_to_this_script]
+    cmd.extend(args)
+    return shlex.join(cmd)
+
+def write_file_if_not_exists(file_path, content, force):
+    # Check for an already installed hook.
+    try:
+        with open(file_path) as f:
+            existing_content = f.read()
+    except FileNotFoundError:
+        pass
+    else:
+        # The file already exists.
+        if existing_content == content:
+            return # Already done
+        else:
+            msg = "A different file already exists: " + file_path
+            if not force:
+                sys.exit("\n".join([
+                    "ERROR: " + msg,
+                    "ERROR: " + "Give --force to overwrite it.",
+                ]))
+            else:
+                print("WARNING: " + msg, file=sys.stderr)
+    # Need to write the file.
+    with open(file_path, "w") as f:
+        f.write(content)
+
+
+def format_refs_db(refs_db):
+    content = "".join(
+        "{}:{}\n".format(ref_name, value)
+        for ref_name, value in sorted(refs_db.items())
+    )
+    return content
+
+def load_saved_refs_db(commit):
+    try:
+        lines = git("cat-file", "-p", commit + ":refs", stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return {}
+
+    result = dict(line.split(":", 1) for line in lines)
+    return result
+
+def compute_refs_db():
+    result = {}
+    try:
+        lines = git("show-ref", "--head")
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 1:
+            # There are no refs. This can happen with a freshly initted git repo.
+            lines = []
+        else:
+            raise
+
+    # From `git help show-ref`:
+    # > The output is in the format: <SHA-1 ID> <space> <reference name>.
+    # Example:
+    #   615624c2c2cfbed7e30a158493b704231b14ff8e refs/heads/main
+    show_ref_line_re = re.compile(r'^([0-9a-f]{40}|[0-9a-f]{64}) (.*)$')
+    remote_head_re = re.compile(r'^refs/remotes/(.*)/HEAD$')
+
+    heads = ["HEAD"]
+    for line in lines:
+        (object_name, ref_name) = show_ref_line_re.match(line).groups()
+        if ref_name == refs_db_ref_name:
+            # Trying to version control the version control db itself would lead to perpetual dirty state.
+            continue
+        result[ref_name] = object_name
+
+        # Note the symbolic looking refs to maybe correct later.
+        if remote_head_re.match(ref_name):
+            heads.append(ref_name)
+
+    for possible_symbolic_ref in heads:
+        try:
+            [ref_value] = git("symbolic-ref", possible_symbolic_ref, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            continue
+        # `git show-ref` resolves symrefs, but that's not what we want.
+        # Update symrefs with their symbolic value instead.
+        result[possible_symbolic_ref] = "ref:" + ref_value
+
+    return result
+
+def git(*args, **kwargs):
+    run_kwargs = dict(
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    run_kwargs.update(kwargs)
+    process = subprocess.run(["git"] + list(args), **run_kwargs)
+    if process.stdout == None:
+        return None
+    return split_lines(process.stdout)
+
+def shorten_ref(ref):
+    if ref.startswith("ref:"): return ref
+    # Using `git rev-parse --short` is too slow, and doesn't work for gc'ed objects.
+    return ref[:12]
+
+def split_lines(output):
+    lines = output.decode("utf8").split("\n")
+    if len(lines) >= 1:
+        assert lines[-1] == ""
+        del lines[-1]
+    return lines
+
+
+def repr_yaml_1_2_str_plain_one_line_in_flow_out_context(s):
+    """
+    This function either returns the string as-is or puts quotes around it.
+
+    Note: This could have just been json.dumps() and it would be perfectly correct,
+    but then everyone would notice that simple strings would have unnecessary quote marks,
+    like:            sparse-checkout: "deps/gwp"
+    instead of:      sparse-checkout: deps/gwp
+    I wanted to just use json.dumps() unconditionally out of contempt for yaml,
+    but somehow i feel like it expresses even more contempt to show
+    just how much complexity is required to correctly deal with
+    one small parameterized corner of this horrendous markupn't language.
+    """
+    if not is_yaml_scalar_in_flow_out_context(s):
+        return json.dumps(s)
+    if not is_yaml_1_2_scalar_str(s):
+        return json.dumps(s)
+    return s
+
+def is_yaml_scalar_in_flow_out_context(s):
+    # https://yaml.org/spec/1.2.2/#733-plain-style
+    # Note: c = FLOW-OUT
+    #
+    # [133] ns-plain-one-line(c) ::= ns-plain-first(c) nb-ns-plain-in-line(c)
+
+    # [126] ns-plain-first(c) ::=
+    #       ( ns-char - c-indicator )
+    #     | ( ( c-mapping-key       # '?'
+    #         | c-mapping-value     # ':'
+    #         | c-sequence-entry    # '-'
+    #         ) [ lookahead = ns-plain-safe(c) ] )
+    #   ns-char ::= nb-char - s-white # -x20 -x09
+    #   nb-char ::= c-printable - b-char - c-byte-order-mark # -x0A -x0D -xFEFF
+    # [1] c-printable ::=
+    #       x09                  # Tab (\t)
+    #     | x0A                  # Line feed (LF \n)
+    #     | x0D                  # Carriage Return (CR \r)
+    #     | [x20-x7E]            # Printable ASCII
+    #     | x85                  # Next Line (NEL)
+    #     | [xA0-xD7FF]          # Basic Multilingual Plane (BMP)
+    #     | [xE000-xFFFD]        # Additional Unicode Areas
+    #     | [x010000-x10FFFF]
+    # [22] c-indicator ::= any of these: -?:,[]{}#&*!|>'"%@`
+    # ns-plain-safe(FLOW-OUT)  ::= ns-char
+    c_printable_non_ascii_chars = '\x85\xA0-\uD7FF\uE000-\uFEFD\uFF00-\uFFFD\U00010000-\U0010FFFF'
+    ns_char_chars = '\\x21-\\x7e' + c_printable_non_ascii_chars
+    ns_plain_safe_flow_out_chars = ns_char_chars
+    ns_char_minus_c_indicator_chars = '$()+.-9;-=A-Z\\\\^_a-z~' + c_printable_non_ascii_chars
+    ns_plain_first_flow_out = '(?:[{}]|[?:-](?=[{}]))'.format(
+        ns_char_minus_c_indicator_chars,
+        ns_plain_safe_flow_out_chars,
+    )
+
+    # [132] nb-ns-plain-in-line(c) ::= ( s-white* ns-plain-char(c) )*
+    # [130] ns-plain-char(c) ::=
+    #     ( ns-plain-safe(c) - c-mapping-value - c-comment ) # -':' -'#'
+    #   | ( [ lookbehind = ns-char ] c-comment ) # '#'
+    #   | ( c-mapping-value [ lookahead = ns-plain-safe(c) ] ) # ':'
+    ns_plain_safe_flow_out_minus_c_mapping_value_minus_c_comment_chars = '\\x21\\x22\\x24-\\x39\\x3b-\\x7e' + c_printable_non_ascii_chars
+    ns_plain_char_flow_out = '(?:[{}]|(?<=[{}])#|:(?=[{}]))'.format(
+        ns_plain_safe_flow_out_minus_c_mapping_value_minus_c_comment_chars,
+        ns_char_chars,
+        ns_plain_safe_flow_out_chars,
+    )
+    nb_ns_plain_in_line_flow_out = '(?:[ \\t]*{})*'.format(ns_plain_char_flow_out)
+
+    ns_plain_one_line_flow_out = ns_plain_first_flow_out + nb_ns_plain_in_line_flow_out
+
+    return re.match('^' + ns_plain_one_line_flow_out + '$', s) != None
+
+def is_yaml_1_2_scalar_str(s):
+    # YAML 1.2, which is used for GitHub Actions probably.
+    # https://yaml.org/spec/1.2.2/#1032-tag-resolution
+    if re.match(
+        '^(?:'
+        '' # /* Empty */
+        '|null|Null|NULL|~'
+        '|true|True|TRUE|false|False|FALSE'
+        '|[-+]?[0-9]+'
+        '|0o[0-7]+'
+        '|0x[0-9a-fA-F]+'
+        '|[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?'
+        '|[-+]?(?:\.inf|\.Inf|\.INF)'
+        '|\.nan|\.NaN|\.NAN'
+        ')$',
+        s,
+    ):
+        return False
+
+    # Note that YAML 1.1 has even more scalar special cases, such as the letter n,
+    # but this function only supports YAML 1.2. If you're curious about 1.1: https://yaml.org/type/bool.html
+    # (Naturally, version 1.1 to 1.2 is a breaking change.)
+    return True
+
+def _test(expect_plain_or_json, s):
+    yaml = repr_yaml_1_2_str_plain_one_line_in_flow_out_context(s)
+    if expect_plain_or_json == "p":
+        assert s == yaml, "Expected plain encoding: " + repr(s)
+    elif expect_plain_or_json == "j":
+        assert json.dumps(s) == yaml, "Expected json quoting: " + repr(s)
+    else: assert False
+_test("p", "a b c")
+_test("j", " a b c")
+_test("j", "a b c ")
+_test("j", "a: b c")
+_test("p", "a:b c")
+_test("p", "a#b c")
+_test("j", "a #b c")
+_test("j", "")
+_test("j", "\n")
+_test("j", "&")
+_test("j", "[]")
+_test("p", "a[")
+_test("j", "'")
+_test("j", '"')
+_test("j", '-')
+_test("p", '-a')
+_test("j", '-0')
+_test("j", '-.inf')
+_test("p", '-inf')
+_test("j", '0.0e0')
+_test("p", '0.0e')
+
+
+if __name__ == "__main__":
+    cli()
