@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 
 import sys, os
-import re, json
-import subprocess, shlex
+import re
+import subprocess
+
+from github import (
+    github_action_permission_note,
+    read_github_action_environment,
+)
+from util import (
+    format_script_to_call_file,
+    write_file_if_not_exists,
+    git,
+)
 
 refs_db_ref_name = "refs/gwp/refs-db"
-github_action_permission_note = "Note: To grant write permissions to a github action, go to your repo in GitHub | Settings | Actions | General | Workflow permissions | Read and write permissions. (As of 2024/01/01.)"
 
 def cli():
     import argparse
@@ -186,12 +195,9 @@ def do_remote_save(as_github_action):
     name_override = None
     email_override = None
     if as_github_action:
-        url = "origin"
-        name_override = os.environ["GITHUB_ACTOR"]
-        email_override = "none@none.invalid"
+        url, name_override, email_override = read_github_action_environment()
     else:
-        url = TODO()
-        assert False, "TODO"
+        assert False
     lines = git("ls-remote", "--symref", url)
     new_db = {}
     symrefs = {}
@@ -240,7 +246,7 @@ def do_remote_save(as_github_action):
 def do_install(force):
     # The reference-transaction hook always executes in the repo root.
     [cwd] = git("rev-parse", "--show-toplevel")
-    save_cmd = format_script_to_call_this_file("save", cwd=cwd)
+    save_cmd = format_script_to_call_file(__file__, "save", cwd=cwd)
 
     [hooks_dir] = git("rev-parse", "--git-path", "hooks")
     preamble = [
@@ -323,42 +329,10 @@ def do_remote_install(force, as_github_action, should_vendor, git_vendor_path):
     elif should_vendor:
         sys.exit("ERROR: This script is already in your repo. Please omit the '--vendor' option.")
 
-    save_refs_script = format_script_to_call_this_file("--remote", "save", "--as-github-action", this_file=this_file, cwd=repo_root)
-
-    action_path = os.path.join(repo_root, ".github/workflows/save-refs.yml")
-    action_yaml = """\
-on:
-  # Capture common activity:
-  push: {}
-  delete: {}
-  # Capture refs/pull/$N/head and refs/pull/$N/merge:
-  pull_request:
-    types: [opened, closed, reopened]
-jobs:
-  Save-Refs:
-    runs-on: ubuntu-latest
-    steps:
-    - name: check out gwp
-      uses: actions/checkout@v4
-      with:
-        sparse-checkout: %(save_refs_dir)s
-    - name: save refs
-      run: %(save_refs_script)s
-""" % {
-        "save_refs_dir": repr_yaml_1_2_str_plain_one_line_in_flow_out_context(os.path.relpath(os.path.dirname(this_file), repo_root)),
-        "save_refs_script": repr_yaml_1_2_str_plain_one_line_in_flow_out_context(save_refs_script),
-    }
-
-    os.makedirs(os.path.dirname(action_path), exist_ok=True)
-    write_file_if_not_exists(action_path, action_yaml, force)
-
-    git("add", os.path.relpath(action_path, repo_root), cwd=repo_root)
-    if git("status", "--porcelain", os.path.relpath(action_path, repo_root), cwd=repo_root):
-        git("status", cwd=repo_root, stdout=None)
-        print("===============================================")
-        print("Run 'git commit' and push the changes.")
-        print(github_action_permission_note)
-        print("===============================================")
+    if as_github_action:
+        do_remote_install_as_github_action(force, repo_root, this_file)
+    else:
+        assert False
 
 def do_vendor(repo_root, this_script_repo_root, git_vendor_path):
     if git_vendor_path == None:
@@ -381,38 +355,6 @@ def do_vendor(repo_root, this_script_repo_root, git_vendor_path):
     ], cwd=repo_root, check=True)
 
     return os.path.join(repo_root, "deps/gwp/git-refs")
-
-def format_script_to_call_this_file(*args, this_file=__file__, cwd):
-    path_to_this_script = os.path.relpath(this_file, cwd)
-    if os.path.sep not in path_to_this_script:
-        path_to_this_script = os.path.join(".", path_to_this_script)
-    cmd = [path_to_this_script]
-    cmd.extend(args)
-    return shlex.join(cmd)
-
-def write_file_if_not_exists(file_path, content, force):
-    # Check for an already installed hook.
-    try:
-        with open(file_path) as f:
-            existing_content = f.read()
-    except FileNotFoundError:
-        pass
-    else:
-        # The file already exists.
-        if existing_content == content:
-            return # Already done
-        else:
-            msg = "A different file already exists: " + file_path
-            if not force:
-                sys.exit("\n".join([
-                    "ERROR: " + msg,
-                    "ERROR: " + "Give --force to overwrite it.",
-                ]))
-            else:
-                print("WARNING: " + msg, file=sys.stderr)
-    # Need to write the file.
-    with open(file_path, "w") as f:
-        f.write(content)
 
 
 def format_refs_db(refs_db):
@@ -472,152 +414,10 @@ def compute_refs_db():
 
     return result
 
-def git(*args, **kwargs):
-    run_kwargs = dict(
-        check=True,
-        stdout=subprocess.PIPE,
-    )
-    run_kwargs.update(kwargs)
-    process = subprocess.run(["git"] + list(args), **run_kwargs)
-    if process.stdout == None:
-        return None
-    return split_lines(process.stdout)
-
 def shorten_ref(ref):
     if ref.startswith("ref:"): return ref
     # Using `git rev-parse --short` is too slow, and doesn't work for gc'ed objects.
     return ref[:12]
-
-def split_lines(output):
-    lines = output.decode("utf8").split("\n")
-    if len(lines) >= 1:
-        assert lines[-1] == ""
-        del lines[-1]
-    return lines
-
-
-def repr_yaml_1_2_str_plain_one_line_in_flow_out_context(s):
-    """
-    This function either returns the string as-is or puts quotes around it.
-
-    Note: This could have just been json.dumps() and it would be perfectly correct,
-    but then everyone would notice that simple strings would have unnecessary quote marks,
-    like:            sparse-checkout: "deps/gwp"
-    instead of:      sparse-checkout: deps/gwp
-    I wanted to just use json.dumps() unconditionally out of contempt for yaml,
-    but somehow i feel like it expresses even more contempt to show
-    just how much complexity is required to correctly deal with
-    one small parameterized corner of this horrendous markupn't language.
-    """
-    if not is_yaml_scalar_in_flow_out_context(s):
-        return json.dumps(s)
-    if not is_yaml_1_2_scalar_str(s):
-        return json.dumps(s)
-    return s
-
-def is_yaml_scalar_in_flow_out_context(s):
-    # https://yaml.org/spec/1.2.2/#733-plain-style
-    # Note: c = FLOW-OUT
-    #
-    # [133] ns-plain-one-line(c) ::= ns-plain-first(c) nb-ns-plain-in-line(c)
-
-    # [126] ns-plain-first(c) ::=
-    #       ( ns-char - c-indicator )
-    #     | ( ( c-mapping-key       # '?'
-    #         | c-mapping-value     # ':'
-    #         | c-sequence-entry    # '-'
-    #         ) [ lookahead = ns-plain-safe(c) ] )
-    #   ns-char ::= nb-char - s-white # -x20 -x09
-    #   nb-char ::= c-printable - b-char - c-byte-order-mark # -x0A -x0D -xFEFF
-    # [1] c-printable ::=
-    #       x09                  # Tab (\t)
-    #     | x0A                  # Line feed (LF \n)
-    #     | x0D                  # Carriage Return (CR \r)
-    #     | [x20-x7E]            # Printable ASCII
-    #     | x85                  # Next Line (NEL)
-    #     | [xA0-xD7FF]          # Basic Multilingual Plane (BMP)
-    #     | [xE000-xFFFD]        # Additional Unicode Areas
-    #     | [x010000-x10FFFF]
-    # [22] c-indicator ::= any of these: -?:,[]{}#&*!|>'"%@`
-    # ns-plain-safe(FLOW-OUT)  ::= ns-char
-    c_printable_non_ascii_chars = '\x85\xA0-\uD7FF\uE000-\uFEFD\uFF00-\uFFFD\U00010000-\U0010FFFF'
-    ns_char_chars = '\\x21-\\x7e' + c_printable_non_ascii_chars
-    ns_plain_safe_flow_out_chars = ns_char_chars
-    ns_char_minus_c_indicator_chars = '$()+.-9;-=A-Z\\\\^_a-z~' + c_printable_non_ascii_chars
-    ns_plain_first_flow_out = '(?:[{}]|[?:-](?=[{}]))'.format(
-        ns_char_minus_c_indicator_chars,
-        ns_plain_safe_flow_out_chars,
-    )
-
-    # [132] nb-ns-plain-in-line(c) ::= ( s-white* ns-plain-char(c) )*
-    # [130] ns-plain-char(c) ::=
-    #     ( ns-plain-safe(c) - c-mapping-value - c-comment ) # -':' -'#'
-    #   | ( [ lookbehind = ns-char ] c-comment ) # '#'
-    #   | ( c-mapping-value [ lookahead = ns-plain-safe(c) ] ) # ':'
-    ns_plain_safe_flow_out_minus_c_mapping_value_minus_c_comment_chars = '\\x21\\x22\\x24-\\x39\\x3b-\\x7e' + c_printable_non_ascii_chars
-    ns_plain_char_flow_out = '(?:[{}]|(?<=[{}])#|:(?=[{}]))'.format(
-        ns_plain_safe_flow_out_minus_c_mapping_value_minus_c_comment_chars,
-        ns_char_chars,
-        ns_plain_safe_flow_out_chars,
-    )
-    nb_ns_plain_in_line_flow_out = '(?:[ \\t]*{})*'.format(ns_plain_char_flow_out)
-
-    ns_plain_one_line_flow_out = ns_plain_first_flow_out + nb_ns_plain_in_line_flow_out
-
-    return re.match('^' + ns_plain_one_line_flow_out + '$', s) != None
-
-def is_yaml_1_2_scalar_str(s):
-    # YAML 1.2, which is used for GitHub Actions probably.
-    # https://yaml.org/spec/1.2.2/#1032-tag-resolution
-    if re.match(
-        '^(?:'
-        '' # /* Empty */
-        '|null|Null|NULL|~'
-        '|true|True|TRUE|false|False|FALSE'
-        '|[-+]?[0-9]+'
-        '|0o[0-7]+'
-        '|0x[0-9a-fA-F]+'
-        '|[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?'
-        '|[-+]?(?:\.inf|\.Inf|\.INF)'
-        '|\.nan|\.NaN|\.NAN'
-        ')$',
-        s,
-    ):
-        return False
-
-    # Note that YAML 1.1 has even more scalar special cases, such as the letter n,
-    # but this function only supports YAML 1.2. If you're curious about 1.1: https://yaml.org/type/bool.html
-    # (Naturally, version 1.1 to 1.2 is a breaking change.)
-    return True
-
-def _test(expect_plain_or_json, s):
-    yaml = repr_yaml_1_2_str_plain_one_line_in_flow_out_context(s)
-    if expect_plain_or_json == "p":
-        assert s == yaml, "Expected plain encoding: " + repr(s)
-    elif expect_plain_or_json == "j":
-        assert json.dumps(s) == yaml, "Expected json quoting: " + repr(s)
-    else: assert False
-_test("p", "a b c")
-_test("j", " a b c")
-_test("j", "a b c ")
-_test("j", "a: b c")
-_test("p", "a:b c")
-_test("p", "a#b c")
-_test("j", "a #b c")
-_test("j", "")
-_test("j", "\n")
-_test("j", "&")
-_test("j", "[]")
-_test("p", "a[")
-_test("j", "'")
-_test("j", '"')
-_test("j", '-')
-_test("p", '-a')
-_test("j", '-0')
-_test("j", '-.inf')
-_test("p", '-inf')
-_test("j", '0.0e0')
-_test("p", '0.0e')
 
 
 if __name__ == "__main__":
