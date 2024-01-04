@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+# Run this from the repo root.
+
+nix-shell --pure -p pylint --run "pylint --errors-only bin/*"

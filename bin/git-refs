@@ -5,6 +5,7 @@ import re
 import subprocess
 
 from github import (
+    do_remote_install_as_github_action,
     github_action_permission_note,
     read_github_action_environment,
 )
@@ -63,7 +64,7 @@ def cli():
         else:
             if not args.as_github_action:
                 parser.error("--as-github-action is required for --remote uninstall")
-            do_remote_uninstall(args.purge)
+            do_remote_uninstall(args.purge, args.as_github_action)
     elif args.action == "log":
         do_log()
 
@@ -94,6 +95,7 @@ def log_loop(history_lines, output_pipe):
     def flush(next_commit, next_date_seconds, next_date_human):
         nonlocal current_commit, current_date_seconds, current_date_human
         nonlocal current_db
+        # pylint: disable=unsubscriptable-object
 
         if next_commit != None:
             next_db = load_saved_refs_db(next_commit)
@@ -333,6 +335,9 @@ def do_remote_install(force, as_github_action, should_vendor, git_vendor_path):
         do_remote_install_as_github_action(force, repo_root, this_file)
     else:
         assert False
+
+def do_remote_uninstall(purge, as_github_action):
+    assert False, "TODO"
 
 def do_vendor(repo_root, this_script_repo_root, git_vendor_path):
     if git_vendor_path == None:
