@@ -128,13 +128,17 @@ def insert_include(contents, template_path_relative):
 
 def prepend_to_top_level_array_or_at_least_try(contents, section, insertion):
     # stages: []
-    # stages: [save-refs]
-    new_contents = re.sub(r'(?<=^' + section + r': \[)(?=[ \t]*\])', insertion, contents, re.MULTILINE)
+    # stages:
+    # - save-refs
+    def replacer(m):
+        # group(1) is "\r" or ""
+        return "{}\n- {}{}".format(m.group(1), insertion, m.group(1))
+    new_contents = re.sub(r'(?<=^' + section + r':) \[[ \t]*\][ \t]*(\r?)(?=\n)', replacer, contents, flags=re.MULTILINE)
     if new_contents != contents: return new_contents
 
     # stages: [something]
     # stages: [save-refs, something]
-    new_contents = re.sub(r'(?<=^' + section + r': \[)(?=[ \t]*[^ \t\]])', insertion + ", ", contents, re.MULTILINE)
+    new_contents = re.sub(r'(?<=^' + section + r': \[)(?=[ \t]*[^ \t\]])', insertion + ", ", contents, flags=re.MULTILINE)
     if new_contents != contents: return new_contents
 
     # stages:
@@ -146,10 +150,10 @@ def prepend_to_top_level_array_or_at_least_try(contents, section, insertion):
         # group(1) is "\r" or ""
         # group(2) is the indentation and bullet, e.g. " - "
         return "{}\n{}{}{}\n{}".format(m.group(1), m.group(2), insertion, m.group(1), m.group(2))
-    new_contents = re.sub(r'(?<=^' + section + r':)[ \t]*(\r?)\n([ \t]*- )', replacer, contents, re.MULTILINE)
+    new_contents = re.sub(r'(?<=^' + section + r':)[ \t]*(\r?)\n([ \t]*- )', replacer, contents, flags=re.MULTILINE)
     if new_contents != contents: return new_contents
 
-    if not re.search(r'^' + section + ':', contents):
+    if not re.search(r'^' + section + ':', contents, flags=re.MULTILINE):
         # Prepend entire section
         return "{}:\n- {}\n\n".format(section, insertion) + contents
 
