@@ -71,8 +71,8 @@ on-deleted-refs:
     os.makedirs(os.path.dirname(template_path), exist_ok=True)
     write_file_if_not_exists(template_path, template_yaml, force)
 
-    git("add", template_path_relative, cwd=repo_root)
-    if git("status", "--porcelain", template_path_relative, cwd=repo_root):
+    git("add", template_path_relative, main_yaml_path_relative, cwd=repo_root)
+    if git("status", "--porcelain", template_path_relative, main_yaml_path_relative, cwd=repo_root):
         git("status", cwd=repo_root, stdout=None)
         print("===============================================")
         print("Run 'git commit' and push the changes.")
