@@ -14,4 +14,4 @@ jobs:
       with:
         sparse-checkout: bin
     - name: save refs
-      run: bin/git-refs --remote save --as-github-action
+      run: bin/git-refs --remote=github-action save

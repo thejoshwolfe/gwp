@@ -3,17 +3,29 @@
 import sys, os
 import re
 import subprocess
+from enum import Enum
 
-from github import (
-    do_remote_install_as_github_action,
-    github_action_permission_note,
-    read_github_action_environment,
-)
 from util import (
     format_script_to_call_file,
     write_file_if_not_exists,
     git,
 )
+from github import (
+    do_remote_install_as_github_action,
+    github_action_setup_note,
+    read_github_action_environment,
+)
+from gitlab import (
+    gitlab_ci_setup_note,
+    read_gitlab_ci_environment,
+    do_remote_install_as_gitlab_ci,
+)
+
+class RemoteTechnology(Enum):
+    GITHUB_ACTION = "github-action"
+    GITLAB_CI = "gitlab-ci"
+    def __str__(self):
+        return self.value
 
 refs_db_ref_name = "refs/gwp/refs-db"
 
@@ -21,15 +33,14 @@ def cli():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["save", "install", "uninstall", "init-in-new-repo", "log"])
-    parser.add_argument("--remote", action="store_true", help=
-        "Switch to the remote version of the command.")
+    parser.add_argument("--remote", type=RemoteTechnology, choices=RemoteTechnology, help=
+        "Switch to the remote version of the command for the given remote technology. "
+        + "===GITHUB-ACTION===  " + github_action_setup_note + " "
+        + "===GITLAB-CI=== " + gitlab_ci_setup_note)
     parser.add_argument("-f", "--force", action="store_true")
     parser.add_argument("--purge", action="store_true", help=
         "also delete the history database forever")
 
-    parser.add_argument("--as-github-action", action="store_true", help=
-        "Give this argument if you're running 'save' or 'install' with '--remote' to determine url, auth, actor, etc. from the environment. "
-        + github_action_permission_note)
     parser.add_argument("--vendor", action="store_true", help=
         "When running 'install' with '--remote', give this option to vendor this program into your repo automatically. "
         "This program will be installed at `deps/gwp/git-refs`. "
@@ -45,26 +56,20 @@ def cli():
         subprocess.run([__file__, "install"], check=True)
         subprocess.run([__file__, "install", "--remote", "--vendor", "--as-github-action"], check=True)
     elif args.action == "save":
-        if not args.remote:
+        if args.remote:
+            do_remote_save(args.remote)
+        else:
             do_save()
-        else:
-            if not args.as_github_action:
-                parser.error("--as-github-action is required for --remote save")
-            do_remote_save(args.as_github_action)
     elif args.action == "install":
-        if not args.remote:
+        if args.remote:
+            do_remote_install(args.force, args.remote, args.vendor, args.git_vendor)
+        else:
             do_install(args.force)
-        else:
-            if not args.as_github_action:
-                parser.error("--as-github-action is required for --remote install")
-            do_remote_install(args.force, args.as_github_action, args.vendor, args.git_vendor)
     elif args.action == "uninstall":
-        if not args.remote:
-            do_uninstall(args.purge)
+        if args.remote:
+            do_remote_uninstall(args.purge, args.remote)
         else:
-            if not args.as_github_action:
-                parser.error("--as-github-action is required for --remote uninstall")
-            do_remote_uninstall(args.purge, args.as_github_action)
+            do_uninstall(args.purge)
     elif args.action == "log":
         do_log()
 
@@ -193,11 +198,13 @@ def make_commit_for_db(new_db, parent_commit_object_name, name_override=None, em
     [commit_object_name] = git(*cmd, input=b"")
     return commit_object_name
 
-def do_remote_save(as_github_action):
+def do_remote_save(remote_technology):
     name_override = None
     email_override = None
-    if as_github_action:
+    if remote_technology == RemoteTechnology.GITHUB_ACTION:
         url, name_override, email_override = read_github_action_environment()
+    elif remote_technology == RemoteTechnology.GITLAB_CI:
+        url, name_override, email_override = read_gitlab_ci_environment()
     else:
         assert False
     lines = git("ls-remote", "--symref", url)
@@ -319,7 +326,7 @@ def install_hook(force, hook_path, content_lines):
     if (os.stat(hook_path).st_mode & 0o100) == 0:
         os.chmod(hook_path, 0o766)
 
-def do_remote_install(force, as_github_action, should_vendor, git_vendor_path):
+def do_remote_install(force, remote_technology, should_vendor, git_vendor_path):
     [repo_root] = git("rev-parse", "--show-toplevel")
     [this_script_repo_root] = git("rev-parse", "--show-toplevel", cwd=os.path.dirname(os.path.abspath(__file__)))
     this_file = __file__
@@ -331,12 +338,16 @@ def do_remote_install(force, as_github_action, should_vendor, git_vendor_path):
     elif should_vendor:
         sys.exit("ERROR: This script is already in your repo. Please omit the '--vendor' option.")
 
-    if as_github_action:
+    if remote_technology == RemoteTechnology.GITHUB_ACTION:
         do_remote_install_as_github_action(force, repo_root, this_file)
+    elif remote_technology == RemoteTechnology.GITLAB_CI:
+        do_remote_install_as_gitlab_ci(force, repo_root, this_file)
     else:
         assert False
 
-def do_remote_uninstall(purge, as_github_action):
+# https://gitlab.com/gitlab-org/gitlab/-/issues/389060
+
+def do_remote_uninstall(purge, remote_technology):
     assert False, "TODO"
 
 def do_vendor(repo_root, this_script_repo_root, git_vendor_path):
