@@ -29,7 +29,11 @@ def read_gitlab_ci_environment():
     url = "https://oauth2:{ACCESS_TOKEN}@{CI_SERVER_HOST}/{CI_PROJECT_PATH}.git".format(**os.environ)
     name_override = os.environ["GITLAB_USER_NAME"]
     email_override = "none@none.invalid"
-    return url, name_override, email_override
+    ignore_prefixes = (
+        "refs/pipelines/", # These come and go while we are looking for them, so they're always different.
+        "refs/environments/", # These are created for every(?) pipeline, so it would always look different.
+    )
+    return url, name_override, email_override, ignore_prefixes
 
 def do_remote_install_as_gitlab_ci(force, repo_root, git_refs_program_path):
     main_yaml_path_relative = ".gitlab-ci.yml"
@@ -127,6 +131,8 @@ def insert_include(contents, template_path_relative):
     return prepend_to_top_level_array_or_at_least_try(contents, r'include', "local: /" + template_path_relative)
 
 def prepend_to_top_level_array_or_at_least_try(contents, section, insertion):
+    # pylint: disable=function-redefined
+
     # stages: []
     # stages:
     # - save-refs

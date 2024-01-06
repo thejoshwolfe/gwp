@@ -202,9 +202,9 @@ def do_remote_save(remote_technology):
     name_override = None
     email_override = None
     if remote_technology == RemoteTechnology.GITHUB_ACTION:
-        url, name_override, email_override = read_github_action_environment()
+        url, name_override, email_override, additional_ignore_prefixes = read_github_action_environment()
     elif remote_technology == RemoteTechnology.GITLAB_CI:
-        url, name_override, email_override = read_gitlab_ci_environment()
+        url, name_override, email_override, additional_ignore_prefixes = read_gitlab_ci_environment()
     else:
         assert False
     lines = git("ls-remote", "--symref", url)
@@ -214,6 +214,8 @@ def do_remote_save(remote_technology):
         value, ref_name = line.split("\t", 1)
         if ref_name == refs_db_ref_name:
             # Trying to version control the version control db itself would lead to perpetual dirty state.
+            continue
+        if any(ref_name.startswith(prefix) for prefix in additional_ignore_prefixes):
             continue
         if value.startswith("ref: "):
             symrefs[ref_name] = "ref:" + value[len("ref: "):]

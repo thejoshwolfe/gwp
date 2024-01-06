@@ -15,7 +15,7 @@ def read_github_action_environment():
     url = "origin"
     name_override = os.environ["GITHUB_ACTOR"]
     email_override = "none@none.invalid"
-    return url, name_override, email_override
+    return url, name_override, email_override, ()
 
 def do_remote_install_as_github_action(force, repo_root, git_refs_program_path):
     save_refs_script = format_script_to_call_file(git_refs_program_path, "--remote=github-action", "save", cwd=repo_root)
