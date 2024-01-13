@@ -73,12 +73,18 @@ def cli():
         else:
             do_uninstall(args.purge)
     elif args.action == "log":
-        do_log()
+        if args.remote:
+            do_remote_log()
+        else:
+            do_log(refs_db_ref_name)
 
-def do_log():
+def do_remote_log():
+    git("fetch", "origin", refs_db_ref_name)
+    do_log("FETCH_HEAD")
+def do_log(history_ref):
     try:
         history_lines = git(
-            "rev-list", "--format=%H %at %ah", "--no-commit-header", refs_db_ref_name,
+            "rev-list", "--format=%H %at %ah", "--no-commit-header", history_ref,
             stderr=subprocess.DEVNULL,
         )
     except subprocess.CalledProcessError:
