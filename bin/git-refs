@@ -55,8 +55,9 @@ def cli():
     args = parser.parse_args()
 
     if args.action == "init-in-new-repo":
+        remote_technology = args.remote or infer_remote_technology()
         subprocess.run([__file__, "install"], check=True)
-        subprocess.run([__file__, "install", "--remote", "--vendor", "--as-github-action"], check=True)
+        subprocess.run([__file__, "install", "--remote", remote_technology.value, "--vendor"], check=True)
     elif args.action == "save":
         if args.remote:
             do_remote_save(args.remote)
@@ -492,6 +493,13 @@ def shorten_ref(ref):
     # Using `git rev-parse --short` is too slow, and doesn't work for gc'ed objects.
     return ref[:12]
 
+def infer_remote_technology():
+    [url] = git("remote", "get-url", "origin")
+    if "github.com" in url:
+        return RemoteTechnology.GITHUB_ACTION
+    if "gitlab.com" in url:
+        return RemoteTechnology.GITLAB_CI
+    sys.exit("ERROR: cannot infer remote technology from url: {}, please provide --remote".format(url))
 
 if __name__ == "__main__":
     cli()
