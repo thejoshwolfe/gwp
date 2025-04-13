@@ -74,17 +74,17 @@ def is_yaml_1_2_scalar_str(s):
     # YAML 1.2, which is used for GitHub Actions probably.
     # https://yaml.org/spec/1.2.2/#1032-tag-resolution
     if re.match(
-        '^(?:'
-        '' # /* Empty */
-        '|null|Null|NULL|~'
-        '|true|True|TRUE|false|False|FALSE'
-        '|[-+]?[0-9]+'
-        '|0o[0-7]+'
-        '|0x[0-9a-fA-F]+'
-        '|[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?'
-        '|[-+]?(?:\.inf|\.Inf|\.INF)'
-        '|\.nan|\.NaN|\.NAN'
-        ')$',
+        r'^(?:'
+        r'' # /* Empty */
+        r'|null|Null|NULL|~'
+        r'|true|True|TRUE|false|False|FALSE'
+        r'|[-+]?[0-9]+'
+        r'|0o[0-7]+'
+        r'|0x[0-9a-fA-F]+'
+        r'|[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?'
+        r'|[-+]?(?:\.inf|\.Inf|\.INF)'
+        r'|\.nan|\.NaN|\.NAN'
+        r')$',
         s,
     ):
         return False
